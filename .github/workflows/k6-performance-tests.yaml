@@ -14,12 +14,56 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history
+
+      - name: Find changed test files
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+          fi
+
+          # Added, copied, modified or renamed test files (deleted ones are skipped)
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            # No usable base (e.g. first push or force push): run every test
+            files=$(git ls-files 'tests/*.js')
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            files=$(git diff --name-only --diff-filter=ACMR "$base...HEAD" -- 'tests/*.js')
+          else
+            files=$(git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'tests/*.js')
+          fi
+
+          echo "Changed test files:"
+          echo "${files:-<none>}"
+
+          {
+            echo "files<<EOF"
+            echo "$files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up k6
+        if: steps.changed.outputs.files != ''
         uses: grafana/setup-k6-action@v1
 
-      - name: Run k6 performance tests
-        uses: grafana/run-k6-action@v1
-        with:
-          path: ./end-to-end.js
+      - name: Run changed k6 tests
+        if: steps.changed.outputs.files != ''
+        env:
+          FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          status=0
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "::group::k6 run $file"
+            k6 run "$file" || status=1
+            echo "::endgroup::"
+          done <<< "$FILES"
+          exit $status
